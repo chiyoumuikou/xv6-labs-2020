@@ -34,12 +34,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -107,6 +107,13 @@ allocproc(void)
 found:
   p->pid = allocpid();
 
+  p->kernel_pagetable = prockvminit();
+  char *pa = kalloc();
+  if(pa == 0) panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  prockvmmap(p->kernel_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     release(&p->lock);
@@ -130,6 +137,21 @@ found:
   return p;
 }
 
+// free proc's kernel page table
+void proc_freekernel_pagetable(pagetable_t pagetable){
+  for(int i=0;i<512;i++){
+    pte_t pte=pagetable[i];
+    if(pte&PTE_V){
+      pagetable[i]=0;
+      if((pte&(PTE_R|PTE_W|PTE_X))==0){
+        uint64 child = PTE2PA(pte);
+        proc_freekernel_pagetable((pagetable_t)child);
+      }
+    }
+  }
+  kfree((void*)pagetable);
+}
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -139,6 +161,13 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->kstack){
+    pte_t *pte = walk(p->kernel_pagetable, p->kstack, 0);
+    if(pte == 0) return;
+    kfree((void*)PTE2PA(*pte));
+    p->kstack = 0;
+  }
+  if(p->kernel_pagetable) proc_freekernel_pagetable(p->kernel_pagetable);
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -229,6 +258,8 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  
+  kvmcopy(p->pagetable, p->kernel_pagetable, 0, p->sz);
 
   release(&p->lock);
 }
@@ -249,6 +280,8 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
+  kvmcopy(p->pagetable, p->kernel_pagetable, p->sz, sz);
+  prockvminithart(p->kernel_pagetable);
   p->sz = sz;
   return 0;
 }
@@ -274,6 +307,9 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  // Copy pagetable to kernel_pagetable
+  kvmcopy(np->pagetable, np->kernel_pagetable, 0, np->sz);
 
   np->parent = p;
 
@@ -473,10 +509,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        prockvminithart(p->kernel_pagetable);
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        kvminithart();
         c->proc = 0;
 
         found = 1;
